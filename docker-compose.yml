@@ -1,6 +1,9 @@
 services:
   papersite:
     build: ./papersite
+    environment:
+      BIG_MIDS: "1500"        # procedural big graph: 1 + 1500 mids + 3000 leaves
+      BIG_LEAVES: "2"
     ports:
       - "8080:8080"
 
@@ -8,8 +11,11 @@ services:
     build: ./crawler
     environment:
       DATABASE_PATH: /data/crawler.db
+      SEARCH_WORKERS: "2"           # max background searches executing at once
+      SEARCH_CHUNK_SIZE: "100"      # frontier nodes processed per chunk
+      SEARCH_CHUNK_DELAY_MS: "200"  # demo pacing so cancellation is observable; 0 disables
     volumes:
-      - crawler_data:/data        # crawl state survives restarts
+      - crawler_data:/data        # crawl state and search results survive restarts
     ports:
       - "8000:8000"               # interactive API docs: http://localhost:8000/docs
     depends_on:

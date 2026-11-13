@@ -44,6 +44,24 @@ CREATE TABLE IF NOT EXISTS citations (
     dst_url TEXT NOT NULL,
     PRIMARY KEY (job_id, src_url, dst_url)         -- an edge is stored at most once
 );
+
+CREATE TABLE IF NOT EXISTS searches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      INTEGER NOT NULL REFERENCES jobs(id),
+    start_url   TEXT NOT NULL,
+    end_url     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'queued',    -- queued | running | completed
+                                                   -- | not_found | cancelled
+                                                   -- | interrupted | failed
+    created_at  TEXT NOT NULL,
+    started_at  TEXT,                              -- when a worker picked it up
+    finished_at TEXT,
+    snapshot_at TEXT,                              -- the corpus snapshot the search ran on
+    edges       INTEGER,                           -- chain length in edges (completed only)
+    chain       TEXT,                              -- JSON [{url, title}, ...] (completed only)
+    expanded    INTEGER,                           -- nodes expanded (final stats)
+    note        TEXT                               -- e.g. the corpus-scope note for not_found
+);
 """
 
 # paper statuses
@@ -59,6 +77,15 @@ NON_HTML = "non_html"
 JOB_RUNNING = "running"
 JOB_COMPLETED = "completed"
 JOB_FAILED = "failed"
+
+# search statuses
+SEARCH_QUEUED = "queued"
+SEARCH_RUNNING = "running"
+SEARCH_COMPLETED = "completed"
+SEARCH_NOT_FOUND = "not_found"
+SEARCH_CANCELLED = "cancelled"
+SEARCH_INTERRUPTED = "interrupted"
+SEARCH_FAILED = "failed"
 
 
 def utcnow() -> str:
@@ -348,3 +375,105 @@ class Database:
                     (job_id, FAILED),
                 ).fetchall()
             ]
+
+    # -------------------------------------------------------------- searches
+    #
+    # Search rows are tiny metadata writes (submit, claim, finish, cancel).
+    # The heavy BFS state never touches this database: it lives in per-search
+    # scratch files, and the graph itself is read through a separate read-only
+    # snapshot connection, so background searches never hold a write
+    # transaction here and never block crawling, retries or queries.
+
+    def create_search(self, job_id: int, start_url: str, end_url: str) -> int:
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO searches(job_id, start_url, end_url, status, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (job_id, start_url, end_url, SEARCH_QUEUED, utcnow()),
+            )
+            return cur.lastrowid
+
+    def get_search(self, search_id: int):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM searches WHERE id=?", (search_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_searches(self, job_id: int | None = None):
+        sql = "SELECT * FROM searches"
+        args = []
+        if job_id is not None:
+            sql += " WHERE job_id=?"
+            args.append(job_id)
+        sql += " ORDER BY id"
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
+
+    def paper_registered(self, job_id: int, url: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM papers WHERE job_id=? AND url=?", (job_id, url)
+            ).fetchone()
+            return row is not None
+
+    def claim_search_start(self, search_id: int, started_at: str) -> bool:
+        """queued -> running.  Fails if the search was cancelled while queued."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE searches SET status=?, started_at=? WHERE id=? AND status=?",
+                (SEARCH_RUNNING, started_at, search_id, SEARCH_QUEUED),
+            )
+            return cur.rowcount == 1
+
+    def set_search_snapshot(self, search_id: int, snapshot_at: str):
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE searches SET snapshot_at=? WHERE id=?", (snapshot_at, search_id)
+            )
+
+    def finish_search(self, search_id: int, status: str, *, edges=None, chain=None,
+                      expanded=None, note=None) -> bool:
+        """running -> final, compare-and-set.
+
+        If a cancel was accepted first the row is no longer 'running' and the
+        late result is refused (rowcount 0): a cancelled search never gets a
+        result published afterwards.
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE searches SET status=?, finished_at=?, edges=?, chain=?,"
+                " expanded=?, note=? WHERE id=? AND status=?",
+                (status, utcnow(), edges, chain, expanded, note, search_id, SEARCH_RUNNING),
+            )
+            return cur.rowcount == 1
+
+    def cancel_search(self, search_id: int) -> bool:
+        """queued|running -> cancelled, compare-and-set.
+
+        Fails when the search already reached a final state (completion took
+        effect first), in which case the API rejects the cancel with 409.
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE searches SET status=?, finished_at=? WHERE id=? AND status IN (?,?)",
+                (SEARCH_CANCELLED, utcnow(), search_id, SEARCH_QUEUED, SEARCH_RUNNING),
+            )
+            return cur.rowcount == 1
+
+    def recover_searches(self) -> int:
+        """After a restart: queued/running searches are marked interrupted.
+        Their partial traversal state is discarded; no partial chain is kept."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE searches SET status=?, finished_at=?,"
+                " note=COALESCE(note, ?) WHERE status IN (?,?)",
+                (
+                    SEARCH_INTERRUPTED,
+                    utcnow(),
+                    "interrupted by a service restart; no partial chain is available",
+                    SEARCH_QUEUED,
+                    SEARCH_RUNNING,
+                ),
+            )
+            return cur.rowcount
